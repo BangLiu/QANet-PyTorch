@@ -1,4 +1,4 @@
-# QANet-pytorch
+# QANet-PyTorch
 
 ## Introduction
 
