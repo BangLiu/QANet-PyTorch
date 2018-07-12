@@ -7,11 +7,22 @@ import shutil
 import time
 import torch
 import json
+import numpy as np
 from datetime import datetime
 import torch.optim as optim
 from .metric import em_by_begin_end_index, f1_by_begin_end_index
 from .config import *
-from model.modules.predicting import boundary2idx
+
+
+def boundary2idx(start, end, text_length):
+    """
+    Assign each boundary (start, end) a unique
+    index between 0 ~ text_length * (text_length - 1) / 2.
+    """
+    a = text_length - start
+    b = end - start
+    idx = np.cumsum(range(a))[a - 1] + b
+    return idx
 
 
 class Trainer(object):
