@@ -2,505 +2,340 @@
 """
 Load SQuAD dataset.
 """
-import json
-import nltk
 import random
 import torch
-import pickle
+import spacy
 import numpy as np
-from functools import partial
+import ujson as json
+from tqdm import tqdm
+from codecs import open
 from collections import Counter
-from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 from .config import *
-from util.list_utils import del_list_inplace
+from util.file_utils import pickle_dump_large_file, pickle_load_large_file
 
 
-MAX_Q_LEN = 30  # maximum number of tokens in question
-MAX_C_LEN = 400  # maximum number of tokens in context
-MAX_C_S_NUM = 16  # maximum number of sentences in context
-MAX_C_S_LEN = 100  # maximum number of tokens in context sentences
-MAX_W_SIZE = 16  # maximum number of characters in a word
+NLP = spacy.blank("en")
 
 
-class Example(object):
-    """
-    Data sample.
-    """
-
-    def __init__(self, title, context,
-                 question, question_id,
-                 answer_start, answer_text):
-        """
-        Initialize a data sample
-        :param title: title of the Wikipedia article
-        :param context: a passage from the article
-        :param question: a question text
-        :param question_id: a unique question id
-        :param answer_start: start character position in context
-        :param answer_text: answer text
-        """
-        self.title = title
-        self.context = context
-        self.question = question
-        self.question_id = question_id
-        self.answer_start = answer_start
-        self.answer_text = answer_text
-        self.tokenized_context = None
-        self.context_wids = None
-        self.context_cids = None
-        self.tokenized_question = None
-        self.question_wids = None
-        self.question_cids = None
-        self.answer_tpos = None
-        self.split_tokenized_context = None
-        self.context_sent_wids = None
-        self.context_sent_cids = None
-        self.answer_spos = None
-        self.answer_tpos_in_sent = None
+def word_tokenize(sent):
+    doc = NLP(sent)
+    return [token.text for token in doc]
 
 
-def read_json(path, type,
-              debug_mode=False, debug_len=10,
-              delete_long_context=True,
-              delete_long_question=True,
-              longest_context=MAX_C_LEN,
-              longest_question=MAX_Q_LEN):
-    """
-    Read SQuAD json file into a list of Example objects.
-    :param path: data path
-    :param type: "train" or other
-    :param debug_mode: if debut_mode is True, only load a few samples
-    :param debug_len: how many samples to load when debug
-    :param delete_long_context: whether delete long context sample
-    :param delete_long_question: whether delete long question sample
-    :param longest_context: maximum context length to keep
-    :param longest_question: maximum question length to keep
-    :return: a list of Example instances
-    """
-    with open(path) as fin:
-        data = json.load(fin)
+def convert_idx(text, tokens):
+    current = 0
+    spans = []
+    for token in tokens:
+        current = text.find(token, current)
+        if current < 0:
+            print("Token {} cannot be found".format(token))
+            raise Exception()
+        spans.append((current, current + len(token)))
+        current += len(token)
+    return spans
+
+
+def filter_func(config, example):
+    return (len(example["context_tokens"]) > config.para_limit or
+            len(example["ques_tokens"]) > config.ques_limit or
+            (example["y2s"][0] - example["y1s"][0]) > config.ans_limit)
+
+
+def get_examples(filename, data_type, word_counter, char_counter,
+                 debug=False, debug_length=1):
+    print("Generating {} examples...".format(data_type))
     examples = []
-    for topic in data["data"]:
-        title = topic["title"]
-        for p in topic['paragraphs']:
-            qas = p['qas']
-            context = p['context']
-            if delete_long_context and \
-                    len(nltk.word_tokenize(context)) > longest_context:
-                continue
-            for qa in qas:
-                question = qa["question"]
-                answers = qa["answers"]
-                if delete_long_question and \
-                        len(nltk.word_tokenize(question)) > longest_question:
-                    continue
-                question_id = qa["id"]
+    meta = {}
+    eval_examples = {}
+    with open(filename, "r") as fh:
+        source = json.load(fh)
+        version = source["version"]
+        meta["version"] = version
+        meta["num_q"] = 0
+        meta["num_q_answerable"] = 0
+        meta["num_qa_answerable"] = 0
+        meta["num_q_noanswer"] = 0
+        for article in tqdm(source["data"]):
+            for para in article["paragraphs"]:
+                context = para["context"].replace(
+                    "''", '" ').replace("``", '" ')
+                context_tokens = word_tokenize(context)
+                context_chars = [list(token) for token in context_tokens]
+                spans = convert_idx(context, context_tokens)
+                for token in context_tokens:
+                    word_counter[token] += len(para["qas"])
+                    for char in token:
+                        char_counter[char] += len(para["qas"])
+                for qa in para["qas"]:
+                    meta["num_q"] += 1
+                    ques = qa["question"].replace(
+                        "''", '" ').replace("``", '" ')
+                    ques_tokens = word_tokenize(ques)
+                    ques_chars = [list(token) for token in ques_tokens]
+                    for token in ques_tokens:
+                        word_counter[token] += 1
+                        for char in token:
+                            char_counter[char] += 1
+                    y1s, y2s = [], []
+                    answer_texts = []
+                    answers = qa["answers"]
+                    answerable = 1
+                    if version == "v2.0" and qa["is_impossible"] is True:
+                        answers = qa["plausible_answers"]
+                        answerable = 0
+                    meta["num_q_answerable"] += answerable
+                    if len(answers) == 0:
+                        meta["num_q_noanswer"] += 1
+                        continue
+                    for answer in answers:
+                        answer_text = answer["text"]
+                        answer_start = answer['answer_start']
+                        answer_end = answer_start + len(answer_text)
+                        answer_texts.append(answer_text)
+                        answer_span = []
+                        for idx, span in enumerate(spans):
+                            if not (answer_end <= span[0] or
+                                    answer_start >= span[1]):
+                                answer_span.append(idx)
+                        y1, y2 = answer_span[0], answer_span[-1]
+                        y1s.append(y1)
+                        y2s.append(y2)
+                        meta["num_qa_answerable"] += answerable
+                    example = {
+                        "context_tokens": context_tokens,
+                        "context_chars": context_chars,
+                        "ques_tokens": ques_tokens,
+                        "ques_chars": ques_chars,
+                        "y1s": y1s,
+                        "y2s": y2s,
+                        "id": meta["num_q"],
+                        "context": context,
+                        "spans": spans,
+                        "answers": answer_texts,
+                        "answerable": answerable,
+                        "uuid": qa["id"]}
+                    examples.append(example)
+                    eval_examples[str(meta["num_q"])] = {
+                        "context": context,
+                        "spans": spans,
+                        "answers": answer_texts,
+                        "uuid": qa["id"]}
+                    if debug and meta["num_q"] >= debug_length:
+                        return examples, meta
+        random.shuffle(examples)
+        print("{} questions in total".format(len(examples)))
+    return examples, meta, eval_examples
 
-                if type == "train":
-                    for ans in answers:
-                        answer_start = int(ans["answer_start"])
-                        answer_text = ans["text"]
-                        e = Example(title, context, question, question_id,
-                                    answer_start, answer_text)
-                        examples.append(e)
-                        if debug_mode and len(examples) >= debug_len:
-                            return examples
-                else:
-                    answer_start_list = \
-                        [ans["answer_start"] for ans in answers]
-                    c = Counter(answer_start_list)
-                    most_common_answer, freq = c.most_common()[0]
-                    answer_text = None
-                    answer_start = None
-                    if freq > 1:
-                        for i, ans_start in enumerate(answer_start_list):
-                            if ans_start == most_common_answer:
-                                answer_text = answers[i]["text"]
-                                answer_start = answers[i]["answer_start"]
-                                break
-                    else:
-                        answer_text = answers[random.choice(
-                            range(len(answers)))]["text"]
-                        answer_start = answers[random.choice(
-                            range(len(answers)))]["answer_start"]
-                    e = Example(title, context, question,
-                                question_id, answer_start, answer_text)
-                    examples.append(e)
-                    if debug_mode and len(examples) >= debug_len:
-                        return examples
-    print("#examples :%s" % len(examples))
-    return examples
 
-
-def tokenize_context_with_answer(context, answer_text, answer_start):
-    """
-    Tokenize context and locate the answer token-level position
-    after tokenized the context,
-    as the original location is based on char-level
-    :param context: context
-    :param answer_text: answer text
-    :param answer_start: answer start position (char level)
-    :return: tokenized context,
-        answer start token index,
-        answer end token index (inclusive)
-    """
-    fore = context[:answer_start]
-    mid = context[answer_start: answer_start + len(answer_text)]
-    after = context[answer_start + len(answer_text):]
-    tokenized_fore = nltk.word_tokenize(fore)
-    tokenized_mid = nltk.word_tokenize(mid)
-    tokenized_after = nltk.word_tokenize(after)
-    tokenized_text = nltk.word_tokenize(answer_text)
-    for i, j in zip(tokenized_text, tokenized_mid):
-        if i != j:
-            return None
-    words = []
-    words.extend(tokenized_fore)
-    words.extend(tokenized_mid)
-    words.extend(tokenized_after)
-    answer_start_token = len(tokenized_fore)
-    answer_end_token = len(tokenized_fore) + len(tokenized_mid) - 1
-    return words, answer_start_token, answer_end_token
-
-
-def tokenize_context(context, answer_text, answer_start):
-    """
-    Sentence tokenize and word tokenize context and locate
-    the answer sentence level, global token level, and local
-    token level position, after tokenized the context.
-    :param context: context
-    :param answer_text: answer text
-    :param answer_start: answer start position (char level)
-    :return: tokenized_context, 1D list, context tokens
-        answer_tpos_start, int, answer start token position
-        answer_tpos_end, int, answer end token position
-        split_tokenized_context, 2D list, tokens of sentences in context
-        answer_spos, int, answer in which sentence of context
-        answer_tpos_start_in_sent, int, answer start token position in sentence
-        answer_tpos_end_in_sent, int, answer end token position in sentence
-    """
-    # tokenize context without sentence split
-    tokenized = tokenize_context_with_answer(
-        context, answer_text, answer_start)
-    if tokenized is None:
-        return None
+def get_embedding(counter, data_type,
+                  emb_file=None, size=None, vec_size=None,
+                  limit=-1, specials=["<PAD>", "<OOV>", "<SOS>", "<EOS>"]):
+    print("Generating {} embedding...".format(data_type))
+    embedding_dict = {}
+    filtered_elements = [k for k, v in counter.items() if v > limit]
+    if emb_file is not None:
+        assert size is not None
+        assert vec_size is not None
+        with open(emb_file, "r", encoding="utf-8") as fh:
+            for line in tqdm(fh, total=size):
+                array = line.split()
+                word = "".join(array[0:-vec_size])
+                vector = list(map(float, array[-vec_size:]))
+                if word in counter and counter[word] > limit:
+                    embedding_dict[word] = vector
+        print("{} / {} tokens have corresponding {} embedding vector".format(
+            len(embedding_dict), len(filtered_elements), data_type))
     else:
-        tokenized_context, answer_tpos_start, answer_tpos_end =\
-            tokenized
+        assert vec_size is not None
+        for token in filtered_elements:
+            embedding_dict[token] = [
+                np.random.normal(scale=0.1) for _ in range(vec_size)]
+        print("{} tokens have corresponding embedding vector".format(
+            len(filtered_elements)))
 
-    answer_end = answer_start + len(answer_text) - 1
-
-    # split sentence for context
-    sents = nltk.sent_tokenize(context)
-    num_sent = len(sents)
-    sent_lengths = [len(s) for s in sents]
-    sent_end_cpos = np.cumsum(sent_lengths)
-    sent_end_cpos = (sent_end_cpos - np.ones(num_sent) +
-                     np.array(list(range(num_sent))))
-
-    # answer in which sentence
-    answer_spos = []
-    for i in range(num_sent):
-        if answer_text in sents[i]:
-            answer_spos.append(i)
-    if len(answer_spos) == 0:
-        print("answer span multi sentence")
-        return None
-    elif len(answer_spos) == 1:
-        answer_spos = answer_spos[0]
-    else:
-        answer_spos = answer_spos[-1]
-        for i in range(num_sent):
-            if answer_end <= sent_end_cpos[i]:
-                answer_spos = i
-                break
-    if answer_spos >= MAX_C_S_NUM:
-        print("answer sentence position too long")
-        return None
-
-    # answer start char position in the sentence
-    new_answer_start = answer_start
-    if answer_spos > 0:
-        new_answer_start = (answer_start -
-                            sent_end_cpos[answer_spos - 1])
-    answer_start_in_sent = [i for i in range(len(sents[answer_spos]))
-                            if sents[answer_spos].startswith(answer_text, i)]
-    if len(answer_start_in_sent) == 0:
-        print("cannot find answer in split sentence")
-        return None
-    elif len(answer_start_in_sent) == 1:
-        new_answer_start = answer_start_in_sent[0]
-    else:
-        new_answer_start = int(min(answer_start_in_sent,
-                                   key=lambda x: abs(x - new_answer_start)))
-
-    # tokenize all context sentences
-    split_tokenized_context = []
-    for i in range(len(sents)):
-        if i == answer_spos:
-            answer_sent_tokenize = tokenize_context_with_answer(
-                sents[answer_spos], answer_text, new_answer_start)
-            if answer_sent_tokenize is None:
-                print("cannot find answer after tokenize answer sentence")
-                return None
-            else:
-                (tokenized_answer_sent,
-                 answer_tpos_start_in_sent,
-                 answer_tpos_end_in_sent) = answer_sent_tokenize
-                if len(tokenized_answer_sent) > MAX_C_S_LEN:
-                    print("answer sentence too long")
-                    return None
-                split_tokenized_context.append(tokenized_answer_sent)
-        else:
-            sent_tokens = nltk.word_tokenize(sents[i])
-            split_tokenized_context.append(sent_tokens)
-
-    return (tokenized_context,
-            int(answer_tpos_start), int(answer_tpos_end),
-            split_tokenized_context,
-            int(answer_spos),
-            int(answer_tpos_start_in_sent), int(answer_tpos_end_in_sent))
+    token2idx_dict = {token: idx
+                      for idx, token
+                      in enumerate(embedding_dict.keys(), len(specials))}
+    for i in range(len(specials)):
+        token2idx_dict[specials[i]] = i
+        embedding_dict[specials[i]] = [0. for _ in range(vec_size)]
+    idx2emb_dict = {idx: embedding_dict[token]
+                    for token, idx in token2idx_dict.items()}
+    emb_mat = [idx2emb_dict[idx] for idx in range(len(idx2emb_dict))]
+    return emb_mat, token2idx_dict
 
 
-def padding2d(seqs, pad_id, pad_size):
-    padded_seqs = np.ones([len(seqs), pad_size]) * pad_id
-    for i in range(len(seqs)):
-        for j in range(min(len(seqs[i]), pad_size)):
-            padded_seqs[i, j] = seqs[i][j]
-    return padded_seqs
+def word2wid(word, word2idx_dict):
+    for each in (word, word.lower(), word.capitalize(), word.upper()):
+        if each in word2idx_dict:
+            return word2idx_dict[each]
+    return word2idx_dict["<OOV>"]
 
 
-def padding3d(seqs, pad_id, pad_size1, pad_size2):
-    padded_seqs = np.ones([len(seqs), pad_size1, pad_size2]) * pad_id
-    for i in range(len(seqs)):
-        for j in range(min(len(seqs[i]), pad_size1)):
-            for k in range(min(len(seqs[i][j]), pad_size2)):
-                padded_seqs[i, j, k] = seqs[i][j][k]
-    return padded_seqs
+def char2cid(char, char2idx_dict):
+    if char in char2idx_dict:
+        return char2idx_dict[char]
+    return char2idx_dict["<OOV>"]
 
 
-def padding4d(seqs, pad_id, pad_size1, pad_size2, pad_size3):
-    padded_seqs = np.ones([len(seqs), pad_size1, pad_size2, pad_size3]) *\
-        pad_id
-    for i in range(len(seqs)):
-        for j in range(min(len(seqs[i]), pad_size1)):
-            for k in range(min(len(seqs[i][j]), pad_size2)):
-                for l in range(min(len(seqs[i][j][k]), pad_size3)):
-                    padded_seqs[i, j, k, l] = seqs[i][j][k][l]
-    return padded_seqs
+def save(filepath, obj, message=None):
+    if message is not None:
+        print("Saving {}...".format(message))
+    pickle_dump_large_file(obj, filepath)
+
+
+def build_features(config, examples, meta, data_type,
+                   word2idx_dict, char2idx_dict, debug=False):
+    print("Processing {} examples...".format(data_type))
+    total = 0
+    total_ = 0
+    examples_with_features = []
+    for example in tqdm(examples):
+        total_ += 1
+        if filter_func(config, example):
+            continue
+        total += 1
+
+        context_wids = np.ones(
+            [config.para_limit], dtype=np.int32) * \
+            word2idx_dict["<PAD>"]
+        context_cids = np.ones(
+            [config.para_limit, config.char_limit], dtype=np.int32) * \
+            char2idx_dict["<PAD>"]
+        question_wids = np.ones([config.ques_limit], dtype=np.int32) * \
+            word2idx_dict["<PAD>"]
+        question_cids = np.ones(
+            [config.ques_limit, config.char_limit], dtype=np.int32) * \
+            char2idx_dict["<PAD>"]
+        y1 = np.zeros([config.para_limit], dtype=np.float32)
+        y2 = np.zeros([config.para_limit], dtype=np.float32)
+
+        for i, token in enumerate(example["context_tokens"]):
+            context_wids[i] = word2wid(token, word2idx_dict)
+
+        for i, token in enumerate(example["ques_tokens"]):
+            question_wids[i] = word2wid(token, word2idx_dict)
+
+        for i, token in enumerate(example["context_chars"]):
+            for j, char in enumerate(token):
+                if j == config.char_limit:
+                    break
+                context_cids[i, j] = char2cid(char, char2idx_dict)
+
+        for i, token in enumerate(example["ques_chars"]):
+            for j, char in enumerate(token):
+                if j == config.char_limit:
+                    break
+                question_cids[i, j] = char2cid(char, char2idx_dict)
+
+        # !!! use last answer as the target answer
+        start, end = example["y1s"][-1], example["y2s"][-1]
+        y1[start], y2[end] = 1.0, 1.0
+
+        example["context_wids"] = context_wids
+        example["context_cids"] = context_cids
+        example["question_wids"] = question_wids
+        example["question_cids"] = question_cids
+        example["y1"] = start
+        example["y2"] = end
+
+        # don't store unnecessary properties
+        # to save shared memory when loading data
+        example["spans"] = None
+        example["context_tokens"] = None
+        example["context_chars"] = None
+        example["ques_tokens"] = None
+        example["ques_chars"] = None
+        examples_with_features.append(example)
+
+    print("Built {} / {} instances of features in total".format(total, total_))
+    meta["num_q_filtered"] = total
+    return examples_with_features, meta
+
+
+def prepro(config):
+    word_counter, char_counter = Counter(), Counter()
+    train_examples, train_meta, train_eval = get_examples(
+        config.train_file, "train", word_counter, char_counter)
+    dev_examples, dev_meta, dev_eval = get_examples(
+        config.dev_file, "dev", word_counter, char_counter)
+
+    word_emb_file = config.glove_word_file
+    word_emb_size = config.glove_word_size
+    word_emb_dim = config.glove_dim
+    pretrained_char = config.pretrained_char
+    char_emb_file = config.glove_char_file if pretrained_char else None
+    char_emb_size = config.glove_char_size if pretrained_char else None
+    char_emb_dim = config.glove_dim if pretrained_char else config.char_dim
+    word_emb_mat, word2idx_dict = get_embedding(
+        word_counter, "word", emb_file=word_emb_file,
+        size=word_emb_size, vec_size=word_emb_dim)
+    char_emb_mat, char2idx_dict = get_embedding(
+        char_counter, "char", emb_file=char_emb_file,
+        size=char_emb_size, vec_size=char_emb_dim)
+
+    train_examples, train_meta = build_features(
+        config, train_examples, train_meta, "train",
+        word2idx_dict, char2idx_dict)
+    dev_examples, dev_meta = build_features(
+        config, dev_examples, dev_meta, "dev",
+        word2idx_dict, char2idx_dict)
+
+    save(config.word_emb_file, word_emb_mat, message="word embedding")
+    save(config.char_emb_file, char_emb_mat, message="char embedding")
+    save(config.word_dictionary, word2idx_dict, message="word dictionary")
+    save(config.char_dictionary, char2idx_dict, message="char dictionary")
+    save(config.train_examples_file, train_examples, message="train examples")
+    save(config.dev_examples_file, dev_examples, message="dev examples")
+    save(config.train_meta_file, train_meta, message="train meta")
+    save(config.dev_meta_file, dev_meta, message="dev meta")
+    save(config.train_eval_file, train_eval, message="train eval")
+    save(config.dev_eval_file, dev_eval, message="dev eval")
 
 
 class SQuAD(Dataset):
-    def __init__(self, path, itow, wtoi, itoc, ctoi,
-                 split="train", debug_mode=False, debug_len=10):
-        self.insert_start = wtoi.get("<SOS>", None)
-        self.insert_end = wtoi.get("<EOS>", None)
-        self.PAD_wid = wtoi.get("<PAD>", None)
-        self.PAD_cid = ctoi.get("<PAD>", None)
-        self.wtoi = wtoi
-        self.ctoi = ctoi
-        self.itow = itow
-        self.itoc = itoc
-        self.split = split
 
-        # load json
-        self.examples = read_json(
-            path, self.split, debug_mode=debug_mode, debug_len=debug_len)
-
-        # tokenize context and question
-        idxs_to_del = []
-        idx = -1
-
-        for e in self.examples:
-            idx = idx + 1
-
-            tokenized = tokenize_context(
-                e.context, e.answer_text, e.answer_start)
-            if tokenized is None:
-                idxs_to_del.append(idx)
-                continue
-            (tokenized_context,
-             answer_tpos_start, answer_tpos_end,
-             split_tokenized_context,
-             answer_spos,
-             answer_tpos_start_in_sent, answer_tpos_end_in_sent) = tokenized
-            e.tokenized_context = tokenized_context
-            e.answer_tpos = (answer_tpos_start, answer_tpos_end)
-            e.split_tokenized_context = split_tokenized_context
-            e.answer_spos = answer_spos
-            e.answer_tpos_in_sent = (answer_tpos_start_in_sent,
-                                     answer_tpos_end_in_sent)
-
-            e.tokenized_question = nltk.word_tokenize(e.question)
-
-        del_list_inplace(self.examples, idxs_to_del)
-
-        # numerical context and question
-        for e in self.examples:
-            e.question_wids = self._tokens2wids(
-                e.tokenized_question, self.wtoi)
-            e.question_cids = self._tokens2cids(
-                e.tokenized_question, self.ctoi)
-            e.context_wids = self._tokens2wids(
-                e.tokenized_context, self.wtoi)
-            e.context_cids = self._tokens2cids(
-                e.tokenized_context, self.ctoi)
-            e.context_sent_wids = []
-            e.context_sent_cids = []
-            for tokenized_sent in e.split_tokenized_context:
-                e.context_sent_wids.append(
-                    self._tokens2wids(tokenized_sent, self.wtoi))
-                e.context_sent_cids.append(
-                    self._tokens2cids(tokenized_sent, self.ctoi))
-
-    def __getitem__(self, idx):
-        e = self.examples[idx]
-        return (e.question_wids, e.question_cids,
-                e.context_wids, e.context_cids,
-                e.context_sent_wids, e.context_sent_cids,
-                e.answer_spos, e.answer_tpos, e.answer_tpos_in_sent)
+    def __init__(self, examples_file):
+        self.examples = pickle_load_large_file(examples_file)
+        self.num = len(self.examples)
 
     def __len__(self):
-        return len(self.examples)
+        return self.num
 
-    def _tokens2cids(self, seq, ctoi):
-        """
-        Transform a list of tokens to a 2d list of char vector indexes.
-        :param seq: tokenized word list
-        :param ctoi: dictionary to map characters to char vector indexes
-        :return: a 2d list, each item is the char indexes of each token
-        """
-        result = []
-        for word in seq:
-            # transform characters to char indexes
-            result.append(self._tokens2wids(word, ctoi))
-        return result
-
-    def _tokens2wids(self, seq, wtoi, insert_sos=False, insert_eos=False):
-        """
-        Transform a list of tokens to a 1d list of word vector indexes.
-        :param seq: tokenized word list
-        :param wtoi: dictionary to map words to word vector indexes
-        :param insert_sos: whether insert "<SOS>" at the beginning
-        :param insert_eos: whether insert "<EOS>" ate the end
-        :return: a 1d list, each item is the word vector index of each token
-        """
-        result = []
-        if self.insert_start is not None and insert_sos:
-            result.append(self.insert_start)
-        for word in seq:
-            result.append(wtoi.get(word, wtoi["<UNK>"]))
-        if self.insert_end is not None and insert_eos:
-            result.append(self.insert_end)
-        return result
-
-    def _create_collate_fn(self, batch_first=True):
-        """
-        Define how to pack a batch of samples.
-        This functions defines what you will get for a batch of data.
-        :param batch_first: whether the returned tensor is batch_first
-        :return: each batch data will get the following
-            batch_question_lengths, 1D LongTensor,
-                number of tokens of each question
-            batch_question_wids_padded, LongTensor,
-                (batch_size, MAX_Q_LEN)
-            batch_question_cids_padded, LongTensor,
-                (batch_size, MAX_Q_LEN, MAX_W_SIZE)
-            batch_context_lengths, 1D list,
-                number of tokens of each context
-            batch_context_wids_padded, LongTensor,
-                (batch_size, MAX_C_LEN)
-            batch_context_cids_padded, LongTensor,
-                (batch_size, MAX_C_LEN, MAX_W_SIZE)
-            batch_context_sent_lengths, 2D LongTensor,
-                number of tokens of each sentence in each context
-            batch_context_sent_wids_padded, LongTensor,
-                (batch_size, MAX_C_S_NUM, MAX_C_S_LEN)
-            batch_context_sent_cids_padded, LongTensor,
-                (batch_size, MAX_C_S_NUM, MAX_C_S_LEN, MAX_W_SIZE)
-            batch_answer_spos, int,
-                sentence level position of answer in context
-            batch_answer_tpos, tuple like (start, end)
-                token level position of answer in context
-            batch_answer_tpos_in_sent, tuple like (start, end)
-                token level position of answer in answer sentence of context
-        """
-        def collate(examples, this):
-            # same sequence with __getitem__
-            (batch_question_wids, batch_question_cids,
-             batch_context_wids, batch_context_cids,
-             batch_context_sent_wids, batch_context_sent_cids,
-             batch_answer_spos, batch_answer_tpos,
-             batch_answer_tpos_in_sent) = zip(*examples)
-
-            batch_question_lengths = torch.LongTensor(
-                [len(s) for s in batch_question_wids])
-            batch_question_wids_padded = torch.LongTensor(padding2d(
-                batch_question_wids, this.PAD_wid,
-                MAX_Q_LEN).astype(int))
-            batch_question_cids_padded = torch.LongTensor(padding3d(
-                batch_question_cids, this.PAD_cid,
-                MAX_Q_LEN, MAX_W_SIZE).astype(int))
-            batch_context_lengths = torch.LongTensor(
-                [len(s) for s in batch_context_wids])
-            batch_context_wids_padded = torch.LongTensor(padding2d(
-                batch_context_wids, this.PAD_wid,
-                MAX_C_LEN).astype(int))
-            batch_context_cids_padded = torch.LongTensor(padding3d(
-                batch_context_cids, this.PAD_cid,
-                MAX_C_LEN, MAX_W_SIZE).astype(int))
-            batch_context_sent_lengths = torch.LongTensor(padding2d(
-                [[len(s) for s in context_sent]
-                 for context_sent
-                 in batch_context_sent_wids], 0, MAX_C_S_NUM))
-            batch_context_sent_wids_padded = torch.LongTensor(padding3d(
-                batch_context_sent_wids, this.PAD_wid,
-                MAX_C_S_NUM, MAX_C_S_LEN).astype(int))
-            batch_context_sent_cids_padded = torch.LongTensor(padding4d(
-                batch_context_sent_cids, this.PAD_cid,
-                MAX_C_S_NUM, MAX_C_S_LEN, MAX_W_SIZE).astype(int))
-
-            batch_answer_spos = torch.LongTensor(batch_answer_spos)
-            batch_answer_tpos = torch.LongTensor(batch_answer_tpos)
-            batch_answer_tpos_in_sent = torch.LongTensor(
-                batch_answer_tpos_in_sent)
-
-            return (batch_question_lengths,
-                    batch_question_wids_padded,
-                    batch_question_cids_padded,
-                    batch_context_lengths,
-                    batch_context_wids_padded,
-                    batch_context_cids_padded,
-                    batch_context_sent_lengths,
-                    batch_context_sent_wids_padded,
-                    batch_context_sent_cids_padded,
-                    batch_answer_spos,
-                    batch_answer_tpos,
-                    batch_answer_tpos_in_sent)
-
-        return partial(collate, this=self)
-
-    def get_dataloader(self, batch_size,
-                       num_workers=4, shuffle=True, pin_memory=False):
-        """
-        Get PyTorch data loader for this dataset.
-        """
-        return DataLoader(self, batch_size=batch_size, shuffle=shuffle,
-                          collate_fn=self._create_collate_fn(True),
-                          num_workers=num_workers, pin_memory=pin_memory)
+    def __getitem__(self, idx):
+        return (self.examples[idx]["context_wids"],
+                self.examples[idx]["context_cids"],
+                self.examples[idx]["question_wids"],
+                self.examples[idx]["question_cids"],
+                self.examples[idx]["y1"],
+                self.examples[idx]["y2"],
+                self.examples[idx]["y1s"],
+                self.examples[idx]["y2s"],
+                self.examples[idx]["id"],
+                self.examples[idx]["answerable"])
 
 
-def read_dataset(json_file, itow, wtoi, itoc, ctoi,
-                 cache_file, is_debug=False, split="train"):
-    if os.path.isfile(cache_file):
-        print("Read built %s dataset from %s" % (split, cache_file))
-        dataset = pickle.load(open(cache_file, "rb"))
-        print("Finished reading %s dataset from %s" % (split, cache_file))
+def collate(data):
+    Cwid, Ccid, Qwid, Qcid, y1, y2, y1s, y2s, id, answerable = zip(*data)
+    Cwid = torch.tensor(Cwid).long()
+    Ccid = torch.tensor(Ccid).long()
+    Qwid = torch.tensor(Qwid).long()
+    Qcid = torch.tensor(Qcid).long()
+    y1 = torch.from_numpy(np.array(y1)).long()
+    y2 = torch.from_numpy(np.array(y2)).long()
+    id = torch.from_numpy(np.array(id)).long()
+    answerable = torch.tensor(answerable).long()
+    return Cwid, Ccid, Qwid, Qcid, y1, y2, y1s, y2s, id, answerable
 
-    else:
-        print("building %s dataset" % split)
-        dataset = SQuAD(json_file, itow, wtoi, itoc, ctoi,
-                        debug_mode=is_debug, split=split)
-        pickle.dump(dataset, open(cache_file, "wb"))
-    return dataset
+
+def get_loader(examples_file, batch_size, shuffle=False):
+    dataset = SQuAD(examples_file)
+    data_loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,  # num_works > 0 may cause RequestRefused error
+        collate_fn=collate)
+    return data_loader

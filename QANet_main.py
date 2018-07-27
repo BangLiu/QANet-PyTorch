@@ -6,17 +6,19 @@ import os
 import sys
 import argparse
 import math
+import random
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from datetime import datetime
-from data_loader.SQuAD import read_dataset
+from data_loader.SQuAD import prepro, get_loader
 from model.QANet_model import QANet
 from trainer.QANet_trainer import Trainer
-from util.nlp_utils import read_w2v
 from util.visualize import Visualizer
 from model.modules.ema import EMA
+from util.file_utils import pickle_load_large_file
 
 
 data_folder = "../../../datasets/"
@@ -24,77 +26,102 @@ parser = argparse.ArgumentParser(description='Lucy')
 
 # dataset
 parser.add_argument(
-    '--train',
+    '--processed_data',
+    default=False, action='store_true',
+    help='whether the dataset already processed')
+parser.add_argument(
+    '--train_file',
     default=data_folder + 'original/SQuAD/train-v1.1.json',
     type=str, help='path of train dataset')
 parser.add_argument(
-    '--dev',
+    '--dev_file',
     default=data_folder + 'original/SQuAD/dev-v1.1.json',
     type=str, help='path of dev dataset')
 parser.add_argument(
-    '--train_cache',
-    default=data_folder + 'processed/SQuAD/SQuAD.pkl',
-    type=str, help='path of train dataset cache file')
+    '--train_examples_file',
+    default=data_folder + 'processed/SQuAD/train-v1.1-examples.pkl',
+    type=str, help='path of train dataset examples file')
 parser.add_argument(
-    '--dev_cache',
-    default=data_folder + 'processed/SQuAD/SQuAD_dev.pkl',
-    type=str, help='path of dev dataset cache file')
+    '--dev_examples_file',
+    default=data_folder + 'processed/SQuAD/dev-v1.1-examples.pkl',
+    type=str, help='path of dev dataset examples file')
 parser.add_argument(
-    '--train_cache_debug',
-    default=data_folder + 'processed/SQuAD/SQuAD_debug.pkl',
-    type=str, help='path of train dataset cache file for debug')
+    '--train_meta_file',
+    default=data_folder + 'processed/SQuAD/train-v1.1-meta.pkl',
+    type=str, help='path of train dataset meta file')
 parser.add_argument(
-    '--dev_cache_debug',
-    default=data_folder + 'processed/SQuAD/SQuAD_dev_debug.pkl',
-    type=str, help='path of dev dataset cache file for debug')
+    '--dev_meta_file',
+    default=data_folder + 'processed/SQuAD/dev-v1.1-meta.pkl',
+    type=str, help='path of dev dataset meta file')
 parser.add_argument(
-    '--validation_split',
-    default=0.1, type=float,
-    help='ratio of split validation data, [0.0, 1.0) (default: 0.0)')
+    '--train_eval_file',
+    default=data_folder + 'processed/SQuAD/train-v1.1-eval.pkl',
+    type=str, help='path of train dataset eval file')
+parser.add_argument(
+    '--dev_eval_file',
+    default=data_folder + 'processed/SQuAD/dev-v1.1-eval.pkl',
+    type=str, help='path of dev dataset eval file')
+parser.add_argument(
+    '--val_num_batches',
+    default=500, type=int,
+    help='number of batches for evaluation (default: 500)')
 
 # embedding
 parser.add_argument(
-    '--wemb',
-    default=data_folder + 'original/Glove/glove.840B.300d.bin',
+    '--glove_word_file',
+    default=data_folder + 'original/Glove/glove.840B.300d.txt',
     type=str, help='path of word embedding file')
 parser.add_argument(
-    '--wemb_cache',
-    default=data_folder + 'original/Glove/glove.840B.300d.pkl',
-    type=str, help='path of word embedding cache file')
+    '--glove_word_size',
+    default=int(2.2e6), type=int,
+    help='Corpus size for Glove')
 parser.add_argument(
-    '--wemb_size',
+    '--glove_dim',
     default=300, type=int,
     help='word embedding size (default: 300)')
 parser.add_argument(
-    '--wemb_binary',
-    default=True, action='store_false',
-    help='whether the word embedding file is binary')
+    '--word_emb_file',
+    default=data_folder + 'processed/SQuAD/word_emb.pkl',
+    type=str, help='path of word embedding matrix file')
 parser.add_argument(
-    '--cemb',
+    '--word_dictionary',
+    default=data_folder + 'processed/SQuAD/word_dict.pkl',
+    type=str, help='path of word embedding dict file')
+
+parser.add_argument(
+    '--pretrained_char',
+    default=False, action='store_true',
+    help='whether train char embedding or not')
+parser.add_argument(
+    '--glove_char_file',
     default=data_folder + "original/Glove/glove.840B.300d-char.txt",
     type=str, help='path of char embedding file')
 parser.add_argument(
-    '--cemb_cache',
-    default=data_folder + "original/Glove/glove.840B.300d-char.pkl",
-    type=str, help='path of char embedding cache file')
+    '--glove_char_size',
+    default=94, type=int,
+    help='Corpus size for char embedding')
 parser.add_argument(
-    '--cemb_size',
-    default=300, type=int,
-    help='char embedding size (default: 300)')
+    '--char_dim',
+    default=64, type=int,
+    help='char embedding size (default: 64)')
 parser.add_argument(
-    '--cemb_binary',
-    default=False, action='store_true',
-    help='whether the char embedding file is binary')
+    '--char_emb_file',
+    default=data_folder + 'processed/SQuAD/char_emb.pkl',
+    type=str, help='path of char embedding matrix file')
+parser.add_argument(
+    '--char_dictionary',
+    default=data_folder + 'processed/SQuAD/char_dict.pkl',
+    type=str, help='path of char embedding dict file')
 
 # train
 parser.add_argument(
     '-b', '--batch_size',
-    default=16, type=int,
-    help='mini-batch size (default: 16)')
+    default=32, type=int,
+    help='mini-batch size (default: 32)')
 parser.add_argument(
     '-e', '--epochs',
-    default=32, type=int,
-    help='number of total epochs (default: 32)')
+    default=30, type=int,
+    help='number of total epochs (default: 30)')
 
 # debug
 parser.add_argument(
@@ -183,7 +210,7 @@ parser.add_argument(
     help='global Norm gradient clipping rate')
 parser.add_argument(
     '--use_ema',
-    default=True, action='store_false',
+    default=False, action='store_true',
     help='whether use exponential moving average')
 parser.add_argument(
     '--use_early_stop',
@@ -196,26 +223,36 @@ parser.add_argument(
 
 # model
 parser.add_argument(
-    '--c_max_len',
+    '--para_limit',
     default=400, type=int,
     help='maximum context token number')
 parser.add_argument(
-    '--q_max_len',
-    default=30, type=int,
+    '--ques_limit',
+    default=50, type=int,
     help='maximum question token number')
 parser.add_argument(
-    '--d_model',
-    default=128, type=int,
-    help='model hidden size')
+    '--ans_limit',
+    default=30, type=int,
+    help='maximum answer token number')
 parser.add_argument(
-    '--train_cemb',
-    default=False, action='store_true',
-    help='whether train char embedding or not')
+    '--char_limit',
+    default=16, type=int,
+    help='maximum char number in a word')
+parser.add_argument(
+    '--d_model',
+    default=96, type=int,
+    help='model hidden size')
 
 
 def main(args):
     # show configuration
     print(args)
+    random_seed = None
+
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
 
     # set log file
     log = sys.stdout
@@ -223,86 +260,49 @@ def main(args):
         log = open(args.log_file, "a")
 
     # set device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    n_gpu = torch.cuda.device_count()
     if torch.cuda.is_available():
-        print("device is cuda")
-        print("# cuda: ", torch.cuda.device_count())
+        print("device is cuda, # cuda is: ", n_gpu)
     else:
         print("device is cpu")
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # load word vector
-    start = datetime.now()
-    specials = ["<UNK>", "<PAD>", "<SOS>", "<EOS>"]
-    wv_tensor, wv_word2ix, wv_vocab, wv_dim = read_w2v(
-        args.wemb,
-        args.wemb_binary,
-        args.wemb_size,
-        specials,
-        args.wemb_cache)
-    cv_tensor, cv_word2ix, cv_vocab, cv_dim = read_w2v(
-        args.cemb,
-        args.cemb_binary,
-        args.cemb_size,
-        specials,
-        args.cemb_cache)
-    print("Time of loading word vector ", datetime.now() - start)
+    # process word vectors and datasets
+    if not args.processed_data:
+        prepro(args)
 
-    # create random char tensor !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    import numpy as np
-    print("before randomize: ", cv_tensor.shape)
-    args.cemb_size = 64
-    print("args.cemb_size now is: ", args.cemb_size)
-    args.train_cemb = True
-    if args.train_cemb:
-        print("We will train cemb.")
-    cv_tensor_rand = []
-    for i in range(cv_tensor.shape[0]):
-        if i == cv_word2ix["<UNK>"] or \
-                i == cv_word2ix["<PAD>"] or \
-                i == cv_word2ix["<SOS>"] or \
-                i == cv_word2ix["<EOS>"]:
-            print("specials: ", i)
-            cv_tensor_rand.append([0. for _ in range(args.cemb_size)])
-        else:
-            cv_tensor_rand.append(
-                [np.random.normal(scale=0.1) for _ in range(args.cemb_size)])
-    cv_tensor = torch.FloatTensor(cv_tensor_rand)
-    print("after randomize: ", cv_tensor.shape)
+    # load word vectors and datasets
+    wv_tensor = torch.FloatTensor(
+        np.array(pickle_load_large_file(args.word_emb_file), dtype=np.float32))
+    cv_tensor = torch.FloatTensor(
+        np.array(pickle_load_large_file(args.char_emb_file), dtype=np.float32))
+    wv_word2ix = pickle_load_large_file(args.word_dictionary)
 
-    # load dataset
-    train_cache = args.train_cache
-    dev_cache = args.dev_cache
-    if args.debug:
-        train_cache = args.train_cache_debug
-        dev_cache = args.dev_cache_debug
-
-    start = datetime.now()
-    train_data = read_dataset(
-        args.train, wv_vocab, wv_word2ix,
-        cv_vocab, cv_word2ix, train_cache, args.debug)
-    print("#samples in train dataset: ", train_data.__len__())
-    dev_data = read_dataset(
-        args.dev, wv_vocab, wv_word2ix,
-        cv_vocab, cv_word2ix, dev_cache, args.debug, split="dev")
-    print("#samples in dev dataset: ", dev_data.__len__())
-    train_dataloader = train_data.get_dataloader(
-        args.batch_size, shuffle=True, pin_memory=False)
-    dev_dataloader = dev_data.get_dataloader(args.batch_size)
-    print("Time of loading dataset ", datetime.now() - start)
+    train_dataloader = get_loader(
+        args.train_examples_file, args.batch_size)  # !!! why cannot shuffle = True ??
+    dev_dataloader = get_loader(
+        args.dev_examples_file, args.batch_size)
 
     # construct model
     model = QANet(
         wv_tensor,
         cv_tensor,
-        args.c_max_len,
-        args.q_max_len,
+        args.para_limit,
+        args.ques_limit,
         args.d_model,
-        train_cemb=args.train_cemb,
+        train_cemb=(not args.pretrained_char),
         pad=wv_word2ix["<PAD>"])
     model.summary()
     if torch.cuda.device_count() > 1 and args.multi_gpu:
         model = nn.DataParallel(model)
     model.to(device)
+
+    # exponential moving average
+    ema = EMA(args.decay)
+    if args.use_ema:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                ema.register(name, param.data)
 
     # set optimizer and scheduler
     parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -319,13 +319,6 @@ def main(args):
         lr_lambda=lambda ee: cr * math.log2(ee + 1)
         if ee < args.lr_warm_up_num else args.lr)
 
-    # exponential moving average
-    ema = EMA(args.decay)
-    if args.use_ema:
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                ema.register(name, param.data)
-
     # set loss, metrics
     loss = F.nll_loss
 
@@ -340,11 +333,11 @@ def main(args):
     # an identifier (prefix) for saved model
     identifier = type(model).__name__ + '_'
     trainer = Trainer(
-        model, loss,
+        args, model, loss,
         train_data_loader=train_dataloader,
         dev_data_loader=dev_dataloader,
-        train_data=args.train,
-        dev_data=args.dev,
+        train_eval_file=args.train_eval_file,
+        dev_eval_file=args.dev_eval_file,
         optimizer=optimizer,
         scheduler=scheduler,
         epochs=args.epochs,

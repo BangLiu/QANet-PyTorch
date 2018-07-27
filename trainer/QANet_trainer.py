@@ -6,30 +6,17 @@ import os
 import shutil
 import time
 import torch
-import json
-import numpy as np
+import torch.nn.functional as F
 from datetime import datetime
-import torch.optim as optim
-from .metric import em_by_begin_end_index, f1_by_begin_end_index
-from .config import *
-
-
-def boundary2idx(start, end, text_length):
-    """
-    Assign each boundary (start, end) a unique
-    index between 0 ~ text_length * (text_length - 1) / 2.
-    """
-    a = text_length - start
-    b = end - start
-    idx = np.cumsum(range(a))[a - 1] + b
-    return idx
+from .metric import convert_tokens, evaluate_by_dict
+from util.file_utils import pickle_load_large_file
 
 
 class Trainer(object):
 
-    def __init__(self, model, loss,
+    def __init__(self, args, model, loss,
                  train_data_loader, dev_data_loader,
-                 train_data, dev_data,
+                 train_eval_file, dev_eval_file,
                  optimizer, scheduler, epochs, with_cuda,
                  save_dir, verbosity=2, save_freq=1, print_freq=10,
                  resume=False, identifier='',
@@ -40,13 +27,8 @@ class Trainer(object):
                  use_scheduler=False, use_grad_clip=False,
                  use_ema=False, ema=None,
                  use_early_stop=False, early_stop=10):
-        # for evaluate
-        with open(dev_data) as dataset_file:
-            dataset_json = json.load(dataset_file)
-            self.dev_dataset = dataset_json['data']
-        with open(train_data) as dataset_file:
-            dataset_json = json.load(dataset_file)
-            self.train_dataset = dataset_json['data']
+        self.device = torch.device("cuda" if with_cuda else "cpu")
+        self.args = args
 
         self.model = model
         self.loss = loss
@@ -59,10 +41,10 @@ class Trainer(object):
         self.identifier = identifier
         self.visualizer = visualizer
         self.with_cuda = with_cuda
-        self.device = torch.device("cuda" if with_cuda else "cpu")
 
         self.train_data_loader = train_data_loader
         self.dev_data_loader = dev_data_loader
+        self.dev_eval_dict = pickle_load_large_file(dev_eval_file)
         self.is_debug = debug
         self.debug_batchnum = debug_batchnum
         self.logger = logger
@@ -125,140 +107,81 @@ class Trainer(object):
 
         # initialize
         global_loss = 0.0
-        global_em = 0.0
-        global_f1 = 0.0
         last_step = self.step - 1
         last_time = time.time()
 
         # train over batches
         for batch_idx, batch in enumerate(self.train_data_loader):
             # get batch
-            (question_lengths,
+            (context_wids,
+             context_cids,
              question_wids,
              question_cids,
-             context_lengths,
-             context_wids,
-             context_cids,
-             context_sent_lengths,
-             context_sent_wids,
-             context_sent_cids,
-             answer_spos,
-             answer_tpos,
-             answer_tpos_in_sent) = batch
+             y1,
+             y2,
+             y1s,
+             y2s,
+             id,
+             answerable) = batch
             batch_num, question_len = question_wids.size()
-            print("#samples: ", batch_idx * batch_num,
-                  file=self.logger, flush=True)
             _, context_len = context_wids.size()
-            _, sent_num, sent_len = context_sent_wids.size()
-            targets = torch.rand(batch_num).long()
-            sent_boundary_num = int((sent_len + 1) * sent_len / 2)
-            for i in range(batch_num):
-                targets[i] = boundary2idx(
-                    answer_tpos_in_sent[i, 0].item(),
-                    answer_tpos_in_sent[i, 1].item(),
-                    sent_len).tolist() + sent_boundary_num * answer_spos[i]
-            targets = targets.to(self.device)
-            question_lengths = question_lengths.to(self.device)
-            question_wids = question_wids.to(self.device)
-            question_cids = question_cids.to(self.device)
-            context_lengths = context_lengths.to(self.device)
             context_wids = context_wids.to(self.device)
             context_cids = context_cids.to(self.device)
-            context_sent_lengths = context_sent_lengths.to(self.device)
-            context_sent_wids = context_sent_wids.to(self.device)
-            context_sent_cids = context_sent_cids.to(self.device)
-            answer_spos = answer_spos.to(self.device)
-            answer_tpos = answer_tpos.to(self.device)
-            answer_tpos_in_sent = answer_tpos_in_sent.to(self.device)
+            question_wids = question_wids.to(self.device)
+            question_cids = question_cids.to(self.device)
+            y1 = y1.to(self.device)
+            y2 = y2.to(self.device)
+            id = id.to(self.device)
+            answerable = answerable.to(self.device)
 
-            # calculate loss and update model
+            # calculate loss
             self.model.zero_grad()
             p1, p2 = self.model(
                 context_wids,
                 context_cids,
                 question_wids,
                 question_cids)
-            y1, y2 = answer_tpos[:, 0], answer_tpos[:, 1]
-            loss1 = self.loss(p1, y1, size_average=True)
-            loss2 = self.loss(p2, y2, size_average=True)
-            loss = (loss1 + loss2) / 2
+
+            loss1 = self.loss(p1, y1)
+            loss2 = self.loss(p2, y2)
+            loss = torch.mean(loss1 + loss2)
             loss.backward()
-            self.optimizer.step()
-
-            # update learning rate
-            if self.use_scheduler:
-                # during warm up stage, use exponential warm up
-                if self.step < self.lr_warm_up_num - 1:
-                    self.scheduler.step()
-                # after warm up stage, fix scheduler
-                if self.step >= self.lr_warm_up_num - 1 and self.unused:
-                    self.optimizer.param_groups[0]['initial_lr'] = self.lr
-                    self.scheduler = optim.lr_scheduler.ExponentialLR(
-                        self.optimizer, self.decay)
-                    for g in self.optimizer.param_groups:
-                        g['lr'] = self.lr
-                    self.unused = False
-                # print("Learning rate: {}".format(self.scheduler.get_lr()))
-                print("Learning rate: {}".format(
-                    self.optimizer.param_groups[0]['lr']))
-
-            # exponential moving avarage
-            if self.use_ema and self.ema is not None:
-                print("Apply ema")
-                for name, param in self.model.named_parameters():
-                    if param.requires_grad:
-                        param.data = self.ema(name, param.data)
+            global_loss += loss.item()
 
             # gradient clip
             if self.use_grad_clip:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), self.grad_clip)
 
-            # get prediction results and calculate metrics
-            yp1 = torch.argmax(p1, 1)
-            yp2 = torch.argmax(p2, 1)
-            yps = torch.stack([yp1, yp2], dim=1)
-            ymin, _ = torch.min(yps, 1)
-            ymax, _ = torch.max(yps, 1)
-            begin_, end_ = (ymin.float(),
-                            ymax.float())
-            begin, end = (y1.float(),
-                          y2.float())
+            # update model
+            self.optimizer.step()
 
-            em = em_by_begin_end_index(begin_, end_, begin, end)
-            f1 = f1_by_begin_end_index(begin_, end_, begin, end)
+            # update learning rate
+            if self.use_scheduler:
+                self.scheduler.step()
 
-            global_loss += loss.item()
-            global_em += em
-            global_f1 += f1
+            # exponential moving avarage
+            if self.use_ema and self.ema is not None:
+                self.ema(self.model, self.step)
 
-            # evaluate, log, and visualize for each print_freq batches
+            # print training info
             if self.step % self.print_freq == self.print_freq - 1:
                 used_time = time.time() - last_time
                 step_num = self.step - last_step
                 speed = self.train_data_loader.batch_size * \
                     step_num / used_time
                 batch_loss = global_loss / step_num
-                batch_em = global_em / step_num
-                batch_f1 = global_f1 / step_num
-                print("step %d / %d of epoch %d)" % (
-                    batch_idx, len(self.train_data_loader), epoch),
-                    file=self.logger, flush=True)
-                print("loss: ", batch_loss, file=self.logger, flush=True)
-                print("em: ", batch_em, file=self.logger, flush=True)
-                print("f1: ", batch_f1, file=self.logger, flush=True)
-                print("speed: %f examples/sec \n\n" % (speed),
-                      file=self.logger, flush=True)
-                if self.visualizer:
-                    self.visualizer.plot('loss', global_loss / step_num)
-                    self.visualizer.log(
-                        "epoch:{epoch}, step:{step}, loss:{loss}, \
-                        batch_em:{train_em}, batch_f1:{train_f1}".format(
-                            epoch=epoch, step=self.step, loss=batch_loss,
-                            batch_em=str(batch_em), batch_f1=str(batch_f1)))
+                print(("step: {}/{} \t "
+                       "epoch: {} \t "
+                       "lr: {} \t "
+                       "loss: {} \t "
+                       "speed: {} examples/sec").format(
+                           batch_idx, len(self.train_data_loader),
+                           epoch,
+                           self.scheduler.get_lr(),
+                           batch_loss,
+                           speed))
                 global_loss = 0.0
-                global_em = 0.0
-                global_f1 = 0.0
                 last_step = self.step
                 last_time = time.time()
             self.step += 1
@@ -266,104 +189,80 @@ class Trainer(object):
             if self.is_debug and batch_idx >= self.debug_batchnum:
                 break
 
-        # evaluate, log, and visualize for each epoch
-        train_em, train_f1 = self._valid_eopch(self.train_dataset,
-                                               self.train_data_loader)
-        dev_em, dev_f1 = self._valid_eopch(self.dev_dataset,
-                                           self.dev_data_loader)
-        print("train_em: %f" % train_em, file=self.logger, flush=True)
-        print("train_f1: %f" % train_f1, file=self.logger, flush=True)
-        print("dev_em: %f" % dev_em, file=self.logger, flush=True)
-        print("dev_f1: %f" % dev_f1, file=self.logger, flush=True)
-        if self.visualizer:
-            self.visualizer.plot_many(
-                {"train_em": train_em,
-                 "train_f1": train_f1,
-                 "dev_em": dev_em,
-                 "dev_f1": dev_f1})
-            self.visualizer.log(
-                "epoch:{epoch}, \
-                train_em:{train_em}, train_f1:{train_f1}, \
-                dev_em:{dev_em}, dev_f1:{dev_f1}".format(
-                    epoch=epoch,
-                    train_em=str(train_em), train_f1=str(train_f1),
-                    dev_em=str(dev_em), dev_f1=str(dev_f1)))
+        metrics = self._valid_eopch(self.dev_eval_dict, self.dev_data_loader)
+        print("dev_em: %f \t dev_f1: %f" % (
+              metrics["exact_match"], metrics["f1"]))
 
         result = {}
-        result["em"] = dev_em
-        result["f1"] = dev_f1
+        result["em"] = metrics["exact_match"]
+        result["f1"] = metrics["f1"]
         return result
 
-    def _valid_eopch(self, dataset, data_loader):
+    def _valid_eopch(self, eval_dict, data_loader):
         """
         Evaluate model over development dataset.
         Return the metrics: em, f1.
         """
+        if self.use_ema and self.ema is not None:
+            self.ema.assign(self.model)
+
         self.model.eval()
-        begin_ = []
-        end_ = []
-        begin = []
-        end = []
+        answer_dict = {}
         with torch.no_grad():
             for batch_idx, batch in enumerate(data_loader):
-                (question_lengths,
+                (context_wids,
+                 context_cids,
                  question_wids,
                  question_cids,
-                 context_lengths,
-                 context_wids,
-                 context_cids,
-                 context_sent_lengths,
-                 context_sent_wids,
-                 context_sent_cids,
-                 answer_spos,
-                 answer_tpos,
-                 answer_tpos_in_sent) = batch
-                question_lengths = question_lengths.to(self.device)
-                question_wids = question_wids.to(self.device)
-                question_cids = question_cids.to(self.device)
-                context_lengths = context_lengths.to(self.device)
+                 y1,
+                 y2,
+                 y1s,
+                 y2s,
+                 id,
+                 answerable) = batch
                 context_wids = context_wids.to(self.device)
                 context_cids = context_cids.to(self.device)
-                context_sent_lengths = context_sent_lengths.to(self.device)
-                context_sent_wids = context_sent_wids.to(self.device)
-                context_sent_cids = context_sent_cids.to(self.device)
-                answer_spos = answer_spos.to(self.device)
-                answer_tpos = answer_tpos.to(self.device)
-                answer_tpos_in_sent = answer_tpos_in_sent.to(self.device)
+                question_wids = question_wids.to(self.device)
+                question_cids = question_cids.to(self.device)
+                y1 = y1.to(self.device)
+                y2 = y2.to(self.device)
+                answerable = answerable.to(self.device)
 
                 p1, p2 = self.model(
                     context_wids,
                     context_cids,
                     question_wids,
                     question_cids)
-                y1, y2 = answer_tpos[:, 0], answer_tpos[:, 1]
 
-                yp1 = torch.argmax(p1, 1)
-                yp2 = torch.argmax(p2, 1)
-                yps = torch.stack([yp1, yp2], dim=1)
-                ymin, _ = torch.min(yps, 1)
-                ymax, _ = torch.max(yps, 1)
-                batch_begin_, batch_end_ = (ymin.float(), ymax.float())
-                batch_begin, batch_end = (y1.float(), y2.float())
+                p1 = F.softmax(p1, dim=1)
+                p2 = F.softmax(p2, dim=1)
+                outer = torch.matmul(p1.unsqueeze(2), p2.unsqueeze(1))
+                for j in range(outer.size()[0]):
+                    outer[j] = torch.triu(outer[j])
+                    outer[j] = torch.tril(outer[j], self.args.ans_limit)
+                a1, _ = torch.max(outer, dim=2)
+                a2, _ = torch.max(outer, dim=1)
+                ymin = torch.argmax(a1, dim=1)
+                ymax = torch.argmax(a2, dim=1)
+                answer_dict_, _ = convert_tokens(
+                    eval_dict, id.tolist(), ymin.tolist(), ymax.tolist())
+                answer_dict.update(answer_dict_)
 
-                begin_.extend(batch_begin_.cpu().numpy().tolist())
-                end_.extend(batch_end_.cpu().numpy().tolist())
-                begin.extend(batch_begin.cpu().numpy().tolist())
-                end.extend(batch_end.cpu().numpy().tolist())
+                if((batch_idx + 1) == self.args.val_num_batches):
+                    break
 
                 if self.is_debug and batch_idx >= self.debug_batchnum:
                     break
 
+        metrics = evaluate_by_dict(eval_dict, answer_dict)
+        if self.use_ema and self.ema is not None:
+            self.ema.resume(self.model)
         self.model.train()
-        begin_ = torch.FloatTensor(begin_)
-        end_ = torch.FloatTensor(end_)
-        begin = torch.FloatTensor(begin)
-        end = torch.FloatTensor(end)
-        em = em_by_begin_end_index(begin_, end_, begin, end)
-        f1 = f1_by_begin_end_index(begin_, end_, begin, end)
-        return em, f1
+        return metrics
 
     def _save_checkpoint(self, epoch, f1, em, is_best):
+        if self.use_ema and self.ema is not None:
+            self.ema.assign(self.model)
         arch = type(self.model).__name__
         state = {
             'epoch': epoch,
@@ -374,26 +273,24 @@ class Trainer(object):
             'best_em': self.best_em,
             'step': self.step + 1,
             'start_time': self.start_time}
-        if self.use_scheduler:
-            state['unused'] = self.unused
         filename = os.path.join(
             self.save_dir,
             self.identifier +
             'checkpoint_epoch{:02d}_f1_{:.5f}_em_{:.5f}.pth.tar'.format(
                 epoch, f1, em))
-        print("Saving checkpoint: {} ...".format(filename),
-              file=self.logger, flush=True)
+        print("Saving checkpoint: {} ...".format(filename))
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
         torch.save(state, filename)
         if is_best:
             shutil.copyfile(
                 filename, os.path.join(self.save_dir, 'model_best.pth.tar'))
+        if self.use_ema and self.ema is not None:
+            self.ema.resume(self.model)
         return filename
 
     def _resume_checkpoint(self, resume_path):
-        print("Loading checkpoint: {} ...".format(resume_path),
-              file=self.logger, flush=True)
+        print("Loading checkpoint: {} ...".format(resume_path))
         checkpoint = torch.load(resume_path)
         self.start_epoch = checkpoint['epoch'] + 1
         self.model.load_state_dict(checkpoint['state_dict'])
@@ -404,7 +301,5 @@ class Trainer(object):
         self.start_time = checkpoint['start_time']
         if self.use_scheduler:
             self.scheduler.last_epoch = checkpoint['epoch']
-            self.unused = checkpoint['unused']
         print("Checkpoint '{}' (epoch {}) loaded".format(
-            resume_path, self.start_epoch),
-            file=self.logger, flush=True)
+            resume_path, self.start_epoch))

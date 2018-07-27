@@ -8,7 +8,7 @@ class PositionalEncoding(nn.Module):
     """
     Add position information to input tensor.
     :Examples:
-        >>> PositionalEncoding(d_model=6, max_len=10, dropout=0)
+        >>> m = PositionalEncoding(d_model=6, max_len=10, dropout=0)
         >>> input = torch.randn(3, 10, 6)
         >>> output = m(input)
     """

@@ -25,6 +25,7 @@ def normalize_answer(s):
 
     def remove_punc(text):
         exclude = set(string.punctuation)
+        exclude.update('，', '。', '、', '；', '「', '」')
         return ''.join(ch for ch in text if ch not in exclude)
 
     def lower(text):
@@ -162,3 +163,85 @@ def f1_by_begin_end_index(pred_begin, pred_end, begin, end):
         f1_all.append(f1)
     f1 = np.mean(f1_all)
     return f1
+
+
+def em_by_begin_end_index_max(pred_begin, pred_end, begins, ends):
+    batch_size = len(pred_begin)
+    em_all = []
+    for i in range(batch_size):
+        num_answers = len(begins[i])
+        em = []
+        for j in range(num_answers):
+            em.append((pred_begin[i] == begins[i][j]) *
+                      (pred_end[i] == ends[i][j]))
+        em_all.append(max(em))
+    return np.mean(em_all)
+
+
+def f1_by_begin_end_index_max(pred_begin, pred_end, begins, ends):
+    batch_size = len(pred_begin)
+    f1_all = []
+    for i in range(batch_size):
+        num_answers = len(begins[i])
+        f1 = []
+        for j in range(num_answers):
+            pred = range(int(pred_begin[i]), int(pred_end[i] + 1))
+            truth = range(int(begins[i][j]), int(ends[i][j] + 1))
+            overlap_len = len(list(set(pred) & set(truth)))
+            pred_len = pred_end[i] - pred_begin[i] + 1
+            truth_len = ends[i][j] - begins[i][j] + 1
+            precision = overlap_len / pred_len
+            recall = overlap_len / truth_len
+            if overlap_len == 0:
+                f1_ = 0
+            else:
+                f1_ = ((2 * precision * recall) / (precision + recall))
+            f1.append(f1_)
+        f1_all.append(max(f1))
+    return np.mean(f1_all)
+
+
+def convert_tokens(eval_dict, qa_id, pp1, pp2):
+    answer_dict = {}
+    remapped_dict = {}
+    for qid, p1, p2 in zip(qa_id, pp1, pp2):
+        context = eval_dict[str(qid)]["context"]
+        spans = eval_dict[str(qid)]["spans"]
+        uuid = eval_dict[str(qid)]["uuid"]
+        if p1 >= len(spans) or p2 >= len(spans):
+            ans = ""
+        else:
+            start_idx = spans[p1][0]
+            end_idx = spans[p2][1]
+            word_p = ''
+            for index in range(p1, p2 + 1):
+                word_p += context[spans[index][0]: spans[index][1]]
+                word_p += ' '
+            ans = word_p
+        answer_dict[str(qid)] = ans
+        remapped_dict[uuid] = ans
+    return answer_dict, remapped_dict
+
+
+def evaluate_by_dict(eval_dict, answer_dict):
+    f1 = exact_match = total = 0
+    for key, value in answer_dict.items():
+        total += 1
+        ground_truths = eval_dict[key]["answers"]
+        prediction = value
+        exact_match += metric_max_over_ground_truths(
+            exact_match_score, prediction, ground_truths)
+        f1 += metric_max_over_ground_truths(
+            f1_score, prediction, ground_truths)
+    exact_match = 100.0 * exact_match / total
+    f1 = 100.0 * f1 / total
+    return {'exact_match': exact_match, 'f1': f1}
+
+
+if __name__ == "__main__":
+    pred_begin = [1, 0, 1]
+    pred_end = [3, 3, 3]
+    begins = [[1, 0], [1, 0], [1, 1]]
+    ends = [[3, 2], [3, 3], [3, 3]]
+    print(em_by_begin_end_index_max(pred_begin, pred_end, begins, ends))
+    print(f1_by_begin_end_index_max(pred_begin, pred_end, begins, ends))

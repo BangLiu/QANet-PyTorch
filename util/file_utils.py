@@ -55,3 +55,10 @@ def pickle_load_large_file(filepath):
             bytes_in += f_in.read(max_bytes)
     obj = pickle.loads(bytes_in)
     return obj
+
+
+def make_path(filepath):
+    d = os.path.dirname(filepath)
+    if d and not os.path.exists(d):
+        os.makedirs(d)
+    return filepath
