@@ -8,6 +8,7 @@ Contributions are welcomed!
 ## Usage
 
 Run `python3 QANet_main.py --batch_size 32 --epochs 20 --with_cuda --use_ema ` to train model with cuda.
+
 Run `python3 QANet_main.py --batch_size 32 --epochs 20 --with_cuda --use_ema --debug` to debug with small batches data.
 
 ## **Performance**
@@ -17,7 +18,8 @@ EM: 74
 F1: 63
 
 With ema:
-Still testing
+EM: 76.4
+F1: 65.6
 
 ## Structure
 QANet_main.py: code for training QANet.
