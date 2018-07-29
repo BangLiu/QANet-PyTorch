@@ -20,7 +20,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def mask_logits(target, mask):
     mask = mask.type(torch.float32)
-    return target * mask + (1 - mask) * (-1e30)
+    return target * mask + (1 - mask) * (-1e30)  # !!!!!!!!!!!!!!!  do we need * mask after target?
 
 
 class Initialized_Conv1d(nn.Module):
@@ -365,8 +365,6 @@ class QANet(nn.Module):
         p1, p2 = self.out(M0, M1, M2, maskC)
         # print(p1)
         # print(p2)
-        p1 = F.log_softmax(p1, dim=1)        # notice: original add it in train part. We add it here.
-        p2 = F.log_softmax(p2, dim=1)
         return p1, p2
 
     def summary(self):

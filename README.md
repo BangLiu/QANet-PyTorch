@@ -34,5 +34,5 @@ Other codes are utils or neural network common modules library.
 
 
 ## Acknowledge
-1. The QANet structure implementation is mainly based on https://github.com/hengruo/QANet-pytorch and https://github.com/andy840314/QANet-pytorch-.
+1. The QANet structure implementation is mainly based on https://github.com/hengruo/QANet-pytorch and https://github.com/andy840314/QANet-pytorch- and https://github.com/hackiey/QAnet-pytorch.
 2. For a TensorFlow implementation, please refer to https://github.com/NLPLearn/QANet.

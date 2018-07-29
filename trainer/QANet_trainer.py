@@ -142,8 +142,11 @@ class Trainer(object):
                 question_wids,
                 question_cids)
 
-            loss1 = self.loss(p1, y1)
-            loss2 = self.loss(p2, y2)
+            log_p1 = F.log_softmax(p1, dim=1)
+            log_p2 = F.log_softmax(p2, dim=1)
+
+            loss1 = self.loss(log_p1, y1)
+            loss2 = self.loss(log_p2, y2)
             loss = torch.mean(loss1 + loss2)
             loss.backward()
             global_loss += loss.item()
@@ -244,6 +247,7 @@ class Trainer(object):
                 a2, _ = torch.max(outer, dim=1)
                 ymin = torch.argmax(a1, dim=1)
                 ymax = torch.argmax(a2, dim=1)
+
                 answer_dict_, _ = convert_tokens(
                     eval_dict, id.tolist(), ymin.tolist(), ymax.tolist())
                 answer_dict.update(answer_dict_)
