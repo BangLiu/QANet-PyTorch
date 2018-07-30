@@ -295,7 +295,7 @@ class Trainer(object):
 
     def _resume_checkpoint(self, resume_path):
         print("Loading checkpoint: {} ...".format(resume_path))
-        checkpoint = torch.load(resume_path)
+        checkpoint = torch.load(resume_path, map_location=lambda storage, loc: storage)
         self.start_epoch = checkpoint['epoch'] + 1
         self.model.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])

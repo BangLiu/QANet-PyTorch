@@ -14,7 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from datetime import datetime
 from data_loader.SQuAD import prepro, get_loader
-from model.QANet_model import QANet
+from model.QANet_hackiey import QANet                 # !!!!!!!!!!!!!!!!
 from trainer.QANet_trainer import Trainer
 from util.visualize import Visualizer
 from model.modules.ema import EMA
@@ -279,9 +279,9 @@ def main(args):
     wv_word2ix = pickle_load_large_file(args.word_dictionary)
 
     train_dataloader = get_loader(
-        args.train_examples_file, args.batch_size)  # !!! why cannot shuffle = True ??
+        args.train_examples_file, args.batch_size, shuffle=True)
     dev_dataloader = get_loader(
-        args.dev_examples_file, args.batch_size)
+        args.dev_examples_file, args.batch_size, shuffle=True)
 
     # construct model
     model = QANet(
