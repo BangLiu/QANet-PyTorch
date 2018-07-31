@@ -17,9 +17,9 @@ Without ema:
 EM: 74
 F1: 63
 
-With ema:
-EM: 76.4
-F1: 65.6
+With ema (26 epochs):
+EM: 77.16
+F1: 66.43
 
 ## Structure
 QANet_main.py: code for training QANet.
