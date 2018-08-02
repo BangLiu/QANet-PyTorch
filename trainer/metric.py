@@ -25,7 +25,6 @@ def normalize_answer(s):
 
     def remove_punc(text):
         exclude = set(string.punctuation)
-        exclude.update('，', '。', '、', '；', '「', '」')
         return ''.join(ch for ch in text if ch not in exclude)
 
     def lower(text):
@@ -208,18 +207,10 @@ def convert_tokens(eval_dict, qa_id, pp1, pp2):
         context = eval_dict[str(qid)]["context"]
         spans = eval_dict[str(qid)]["spans"]
         uuid = eval_dict[str(qid)]["uuid"]
-        if p1 >= len(spans) or p2 >= len(spans):
-            ans = ""
-        else:
-            start_idx = spans[p1][0]
-            end_idx = spans[p2][1]
-            word_p = ''
-            for index in range(p1, p2 + 1):
-                word_p += context[spans[index][0]: spans[index][1]]
-                word_p += ' '
-            ans = word_p
-        answer_dict[str(qid)] = ans
-        remapped_dict[uuid] = ans
+        start_idx = spans[p1][0]
+        end_idx = spans[p2][1]
+        answer_dict[str(qid)] = context[start_idx: end_idx]
+        remapped_dict[uuid] = context[start_idx: end_idx]
     return answer_dict, remapped_dict
 
 

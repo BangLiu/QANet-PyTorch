@@ -1,97 +1,44 @@
+"""
+Reference: https://github.com/hackiey/QAnet-pytorch/tree/master/qanet
+"""
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
-
+import numpy as np
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-class PositionEncoding(nn.Module):
-    def __init__(self, n_filters=128, min_timescale=1.0, max_timescale=1.0e4):
+class Highway(nn.Module):
+    """ Version 1 : carry gate is (1 - transform gate)"""
 
-        super(PositionEncoding, self).__init__()
+    def __init__(self, input_size=500, n_layers=2):
+        super(Highway, self).__init__()
 
-        self.min_timescale = min_timescale
-        self.max_timescale = max_timescale
-        self.d = n_filters
+        self.n_layers = n_layers
 
-        # we use the fact that cos(x) = sin(x + pi/2) to compute everything with one sin statement
-        self.freqs = torch.Tensor(
-            [max_timescale ** (-i / self.d) if i % 2 == 0 else max_timescale ** (-(i - 1) / self.d) for i in
-             range(self.d)]).unsqueeze(1).to(device)
-        self.phases = torch.Tensor([0 if i % 2 == 0 else np.pi / 2 for i in range(self.d)]).unsqueeze(1).to(device)
+        self.transform = nn.ModuleList(
+            [nn.Conv1d(input_size, input_size, kernel_size=1) for i in range(n_layers)])
+        self.fc = nn.ModuleList([nn.Conv1d(input_size, input_size, kernel_size=1) for i in range(n_layers)])
 
     def forward(self, x):
-
-        # *************** speed up, static pos_enc ******************
-        l = x.shape[-1]
-
-        # computing signal
-        pos = torch.arange(l).repeat(self.d, 1).to(device)
-        tmp = pos * self.freqs + self.phases
-        pos_enc = torch.sin(tmp)
-        x = x + pos_enc
+        for i in range(self.n_layers):
+            transformed = F.sigmoid(self.transform[i](x))
+            carried = F.dropout(self.fc[i](x), p=0.1, training=self.training)
+            x = carried * transformed + x * (1 - transformed)
+            x = F.relu(x)
 
         return x
-
-
-class ModelEncoder(nn.Module):
-    def __init__(self, n_blocks=7, n_conv=2, kernel_size=7, padding=3,
-                 hidden_size=128, conv_type='depthwise_separable', n_heads=8, context_length=400):
-        
-        super(ModelEncoder, self).__init__()
-
-        self.n_conv = n_conv
-        self.n_blocks = n_blocks
-        self.total_layers = (n_conv + 2) * n_blocks
-
-        self.stacked_encoderBlocks = nn.ModuleList([EncoderBlock(n_conv=n_conv,
-                                                                kernel_size=kernel_size,
-                                                                padding=padding,
-                                                                n_filters=hidden_size,
-                                                                conv_type=conv_type,
-                                                                n_heads=n_heads) for i in range(n_blocks)])
-
-    def forward(self, x, mask):
-        
-        for i in range(self.n_blocks):
-            x = self.stacked_encoderBlocks[i](x, mask, i*(self.n_conv+2)+1, self.total_layers)
-        M0 = x
-
-        for i in range(self.n_blocks):
-            x = self.stacked_encoderBlocks[i](x, mask, i*(self.n_conv+2)+1, self.total_layers)
-        M1 = x
-
-        for i in range(self.n_blocks):
-            x = self.stacked_encoderBlocks[i](x, mask, i*(self.n_conv+2)+1, self.total_layers)
-
-        M2 = x
-
-        return M0, M1, M2
-
-
-class LayerNorm1d(nn.Module):
-
-    def __init__(self, n_features, eps=1e-6):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(n_features))
-        self.beta = nn.Parameter(torch.zeros(n_features))
-        self.eps = eps
-
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        x = self.gamma * (x - mean) / (std + self.eps) + self.beta
-        return x.permute(0, 2, 1)
 
 
 class WordEmbedding(nn.Module):
     def __init__(self, word_embeddings):
         super(WordEmbedding, self).__init__()
 
-        self.word_embedding = nn.Embedding.from_pretrained(word_embeddings)
+        self.word_embedding = nn.Embedding(num_embeddings=word_embeddings.shape[0],
+                                           embedding_dim=word_embeddings.shape[1])
+
+        self.word_embedding.weight = nn.Parameter(word_embeddings)
         self.word_embedding.weight.requires_grad = False
 
     def forward(self, input_context, input_question):
@@ -105,8 +52,7 @@ class WordEmbedding(nn.Module):
 
 
 class CharacterEmbedding(nn.Module):
-    def __init__(self, char_embeddings, embedding_dim=32, n_filters=200, kernel_size=5, padding=2,
-                 train_cemb=True):
+    def __init__(self, char_embeddings, embedding_dim=32, n_filters=200, kernel_size=5, padding=2):
         super(CharacterEmbedding, self).__init__()
 
         self.num_embeddings = len(char_embeddings)
@@ -114,11 +60,10 @@ class CharacterEmbedding(nn.Module):
         self.kernel_size = (1, kernel_size)
         self.padding = (0, padding)
 
-        if train_cemb:
-            self.char_embedding = nn.Embedding.from_pretrained(char_embeddings, freeze=False)
-        else:
-            self.char_embedding = nn.Embedding.from_pretrained(char_embeddings)
-
+        self.char_embedding = nn.Embedding(num_embeddings=self.num_embeddings, embedding_dim=embedding_dim)
+        self.char_embedding.weight = nn.Parameter(char_embeddings)
+        # only difference is here: if we use_pretrained, random is different now.
+        # as nn.Embedding used random weight, but from_pretrained doesn't use random
         self.char_conv = nn.Conv2d(in_channels=embedding_dim,
                                    out_channels=n_filters,
                                    kernel_size=self.kernel_size,
@@ -141,28 +86,6 @@ class CharacterEmbedding(nn.Module):
         x, _ = torch.max(x, dim=2)
 
         x = F.dropout(x, p=0.05, training=self.training)
-
-        return x
-
-
-class Highway(nn.Module):
-    """ Version 1 : carry gate is (1 - transform gate)"""
-
-    def __init__(self, input_size=500, n_layers=2):
-        super(Highway, self).__init__()
-
-        self.n_layers = n_layers
-
-        self.transform = nn.ModuleList(
-            [nn.Conv1d(input_size, input_size, kernel_size=1) for i in range(n_layers)])
-        self.fc = nn.ModuleList([nn.Conv1d(input_size, input_size, kernel_size=1) for i in range(n_layers)])
-
-    def forward(self, x):
-        for i in range(self.n_layers):
-            transformed = F.sigmoid(self.transform[i](x))
-            carried = F.dropout(self.fc[i](x), p=0.1, training=self.training)
-            x = carried * transformed + x * (1 - transformed)
-            x = F.relu(x)
 
         return x
 
@@ -201,6 +124,110 @@ class InputEmbedding(nn.Module):
 
         return context, question
 
+
+class PositionEncoding(nn.Module):
+    def __init__(self, n_filters=128, min_timescale=1.0, max_timescale=1.0e4):
+
+        super(PositionEncoding, self).__init__()
+
+        self.min_timescale = min_timescale
+        self.max_timescale = max_timescale
+        self.d = n_filters
+
+        # we use the fact that cos(x) = sin(x + pi/2) to compute everything with one sin statement
+        self.freqs = torch.Tensor(
+            [max_timescale ** (-i / self.d) if i % 2 == 0 else max_timescale ** (-(i - 1) / self.d) for i in
+             range(self.d)]).unsqueeze(1).to(device)
+        self.phases = torch.Tensor([0 if i % 2 == 0 else np.pi / 2 for i in range(self.d)]).unsqueeze(1).to(device)
+
+    def forward(self, x):
+
+        # *************** speed up, static pos_enc ******************
+        l = x.shape[-1]
+
+        # computing signal
+        pos = torch.arange(l).repeat(self.d, 1).to(device)
+        tmp = pos * self.freqs + self.phases
+        pos_enc = torch.sin(tmp)
+        x = x + pos_enc
+
+        return x
+
+class LayerNorm1d(nn.Module):
+
+    def __init__(self, n_features, eps=1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(n_features))
+        self.beta = nn.Parameter(torch.zeros(n_features))
+        self.eps = eps
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        x = self.gamma * (x - mean) / (std + self.eps) + self.beta
+        return x.permute(0, 2, 1)
+
+
+
+class DepthwiseSeparableConv1d(nn.Module):
+
+    def __init__(self, n_filters=128, kernel_size=7, padding=3):
+        super(DepthwiseSeparableConv1d, self).__init__()
+
+        self.depthwise = nn.Conv1d(n_filters, n_filters, kernel_size=kernel_size, padding=padding, groups=n_filters)
+        self.separable = nn.Conv1d(n_filters, n_filters, kernel_size=1)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.separable(x)
+
+        return x
+
+
+class SelfAttention(nn.Module):
+
+    def __init__(self, n_heads=8, n_filters=128):
+        super(SelfAttention, self).__init__()
+
+        self.n_filters = n_filters
+        self.n_heads = n_heads
+
+        self.key_dim = n_filters // n_heads
+        self.value_dim = n_filters // n_heads
+
+        self.fc_query = nn.ModuleList([nn.Linear(n_filters, self.key_dim) for i in range(n_heads)])
+        self.fc_key = nn.ModuleList([nn.Linear(n_filters, self.key_dim) for i in range(n_heads)])
+        self.fc_value = nn.ModuleList([nn.Linear(n_filters, self.value_dim) for i in range(n_heads)])
+        self.fc_out = nn.Linear(n_heads * self.value_dim, n_filters)
+
+    def forward(self, x, mask):
+        batch_size = x.shape[0]
+        l = x.shape[1]
+
+        mask = mask.unsqueeze(-1).expand(x.shape[0], x.shape[1], x.shape[1]).permute(0,2,1)
+
+        heads = torch.zeros(self.n_heads, batch_size, l, self.value_dim, device=device)
+
+        for i in range(self.n_heads):
+            Q = self.fc_query[i](x)
+            K = self.fc_key[i](x)
+            V = self.fc_value[i](x)
+
+            # scaled dot-product attention
+            tmp = torch.bmm(Q, K.permute(0,2,1))
+            tmp = tmp / np.sqrt(self.key_dim)
+            tmp = F.softmax(tmp - 1e30*(1-mask), dim=-1)
+
+            tmp = F.dropout(tmp, p=0.1, training=self.training)
+
+            heads[i] = torch.bmm(tmp, V)
+
+        # concatenation is the same as reshaping our tensor
+        x = heads.permute(1,2,0,3).contiguous().view(batch_size, l, -1)
+        x = self.fc_out(x)
+
+        return x
 
 class EncoderBlock(nn.Module):
 
@@ -270,6 +297,7 @@ class EncoderBlock(nn.Module):
         return outputs
 
 
+
 class EmbeddingEncoder(nn.Module):
     def __init__(self, resize_in=500, hidden_size=128, resize_kernel=7, resize_pad=3,
                  n_blocks=1, n_conv=4, kernel_size=7, padding=3,
@@ -294,22 +322,6 @@ class EmbeddingEncoder(nn.Module):
             question_emb = self.stacked_encoderBlocks[i](question_emb, q_mask, i*(self.n_conv+2)+1, self.total_layers)
 
         return context_emb, question_emb
-
-
-class DepthwiseSeparableConv1d(nn.Module):
-
-    def __init__(self, n_filters=128, kernel_size=7, padding=3):
-        super(DepthwiseSeparableConv1d, self).__init__()
-
-        self.depthwise = nn.Conv1d(n_filters, n_filters, kernel_size=kernel_size, padding=padding, groups=n_filters)
-        self.separable = nn.Conv1d(n_filters, n_filters, kernel_size=1)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.separable(x)
-
-        return x
-
 
 class ContextQueryAttention(nn.Module):
 
@@ -378,49 +390,40 @@ class ContextQueryAttention(nn.Module):
         return X
 
 
-class SelfAttention(nn.Module):
 
-    def __init__(self, n_heads=8, n_filters=128):
-        super(SelfAttention, self).__init__()
+class ModelEncoder(nn.Module):
+    def __init__(self, n_blocks=7, n_conv=2, kernel_size=7, padding=3,
+                 hidden_size=128, conv_type='depthwise_separable', n_heads=8, context_length=400):
+        
+        super(ModelEncoder, self).__init__()
 
-        self.n_filters = n_filters
-        self.n_heads = n_heads
+        self.n_conv = n_conv
+        self.n_blocks = n_blocks
+        self.total_layers = (n_conv + 2) * n_blocks
 
-        self.key_dim = n_filters // n_heads
-        self.value_dim = n_filters // n_heads
-
-        self.fc_query = nn.ModuleList([nn.Linear(n_filters, self.key_dim) for i in range(n_heads)])
-        self.fc_key = nn.ModuleList([nn.Linear(n_filters, self.key_dim) for i in range(n_heads)])
-        self.fc_value = nn.ModuleList([nn.Linear(n_filters, self.value_dim) for i in range(n_heads)])
-        self.fc_out = nn.Linear(n_heads * self.value_dim, n_filters)
+        self.stacked_encoderBlocks = nn.ModuleList([EncoderBlock(n_conv=n_conv,
+                                                                kernel_size=kernel_size,
+                                                                padding=padding,
+                                                                n_filters=hidden_size,
+                                                                conv_type=conv_type,
+                                                                n_heads=n_heads) for i in range(n_blocks)])
 
     def forward(self, x, mask):
-        batch_size = x.shape[0]
-        l = x.shape[1]
+        
+        for i in range(self.n_blocks):
+            x = self.stacked_encoderBlocks[i](x, mask, i*(self.n_conv+2)+1, self.total_layers)
+        M0 = x
 
-        mask = mask.unsqueeze(-1).expand(x.shape[0], x.shape[1], x.shape[1]).permute(0,2,1)
+        for i in range(self.n_blocks):
+            x = self.stacked_encoderBlocks[i](x, mask, i*(self.n_conv+2)+1, self.total_layers)
+        M1 = x
 
-        heads = torch.zeros(self.n_heads, batch_size, l, self.value_dim, device=device)
+        for i in range(self.n_blocks):
+            x = self.stacked_encoderBlocks[i](x, mask, i*(self.n_conv+2)+1, self.total_layers)
 
-        for i in range(self.n_heads):
-            Q = self.fc_query[i](x)
-            K = self.fc_key[i](x)
-            V = self.fc_value[i](x)
+        M2 = x
 
-            # scaled dot-product attention
-            tmp = torch.bmm(Q, K.permute(0,2,1))
-            tmp = tmp / np.sqrt(self.key_dim)
-            tmp = F.softmax(tmp - 1e30*(1-mask), dim=-1)
-
-            tmp = F.dropout(tmp, p=0.1, training=self.training)
-
-            heads[i] = torch.bmm(tmp, V)
-
-        # concatenation is the same as reshaping our tensor
-        x = heads.permute(1, 2, 0, 3).contiguous().view(batch_size, l, -1)
-        x = self.fc_out(x)
-
-        return x
+        return M0, M1, M2
 
 
 class Output(nn.Module):
@@ -596,11 +599,10 @@ class QANet(nn.Module):
                   context_emb*q2c_attn.permute(0, 2, 1)), 1)
 
         mdl_emb = self.projection(mdl_emb)
-
         M0, M1, M2 = self.model_encoder(mdl_emb, c_mask)
 
         p1, p2 = self.output(M0.permute(0,2,1), M1.permute(0,2,1), M2.permute(0,2,1))
-    
+
         p1 = p1 - 1e30*(1 - c_mask)
         p2 = p2 - 1e30*(1 - c_mask)
 
@@ -610,11 +612,3 @@ class QANet(nn.Module):
         model_parameters = filter(lambda p: p.requires_grad, self.parameters())
         params = sum([np.prod(p.size()) for p in model_parameters])
         print('Trainable parameters:', params)
-
-
-if __name__ == '__main__':
-    import json
-    params = json.load(open('params.json', 'r'))
-    qanet = QANet(params)
-
-    print(dir(qanet))

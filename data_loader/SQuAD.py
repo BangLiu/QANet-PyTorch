@@ -186,55 +186,6 @@ def save(filepath, obj, message=None):
     pickle_dump_large_file(obj, filepath)
 
 
-def convert_to_features(config, context, question,
-                        word2idx_dict, char2idx_dict):
-    example = {}
-    context = context.replace("''", '" ').replace("``", '" ')
-    question = question.replace("''", '" ').replace("``", '" ')
-    example['context_tokens'] = word_tokenize(context)
-    example['ques_tokens'] = word_tokenize(question)
-    example['context_chars'] = [
-        list(token) for token in example['context_tokens']]
-    example['ques_chars'] = [
-        list(token) for token in example['ques_tokens']]
-
-    para_limit = config.para_limit
-    ques_limit = config.ques_limit
-    char_limit = config.char_limit
-
-    def filter_func(example):
-        return (len(example["context_tokens"]) > para_limit or
-                len(example["ques_tokens"]) > ques_limit)
-
-    if filter_func(example):
-        raise ValueError("Context/Questions lengths are over the limit")
-
-    context_idxs = np.zeros([para_limit], dtype=np.int32)
-    context_char_idxs = np.zeros([para_limit, char_limit], dtype=np.int32)
-    ques_idxs = np.zeros([ques_limit], dtype=np.int32)
-    ques_char_idxs = np.zeros([ques_limit, char_limit], dtype=np.int32)
-
-    for i, token in enumerate(example["context_tokens"]):
-        context_idxs[i] = word2wid(token, word2idx_dict)
-
-    for i, token in enumerate(example["ques_tokens"]):
-        ques_idxs[i] = word2wid(token, word2idx_dict)
-
-    for i, token in enumerate(example["context_chars"]):
-        for j, char in enumerate(token):
-            if j == char_limit:
-                break
-            context_char_idxs[i, j] = char2cid(char, char2idx_dict)
-
-    for i, token in enumerate(example["ques_chars"]):
-        for j, char in enumerate(token):
-            if j == char_limit:
-                break
-            ques_char_idxs[i, j] = char2cid(char, char2idx_dict)
-
-    return context_idxs, context_char_idxs, ques_idxs, ques_char_idxs
-
-
 def build_features(config, examples, meta, data_type,
                    word2idx_dict, char2idx_dict, debug=False):
     print("Processing {} examples...".format(data_type))

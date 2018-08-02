@@ -142,11 +142,10 @@ class Trainer(object):
                 question_wids,
                 question_cids)
 
-            log_p1 = F.log_softmax(p1, dim=1)
-            log_p2 = F.log_softmax(p2, dim=1)
-
-            loss1 = self.loss(log_p1, y1)
-            loss2 = self.loss(log_p2, y2)
+            # log_p1 = F.log_softmax(p1, dim=1)
+            # log_p2 = F.log_softmax(p2, dim=1)
+            loss1 = self.loss(p1, y1)
+            loss2 = self.loss(p2, y2)
             loss = torch.mean(loss1 + loss2)
             loss.backward()
             global_loss += loss.item()
@@ -242,12 +241,11 @@ class Trainer(object):
                 outer = torch.matmul(p1.unsqueeze(2), p2.unsqueeze(1))
                 for j in range(outer.size()[0]):
                     outer[j] = torch.triu(outer[j])
-                    outer[j] = torch.tril(outer[j], self.args.ans_limit)
+                    # outer[j] = torch.tril(outer[j], self.args.ans_limit)
                 a1, _ = torch.max(outer, dim=2)
                 a2, _ = torch.max(outer, dim=1)
                 ymin = torch.argmax(a1, dim=1)
                 ymax = torch.argmax(a2, dim=1)
-
                 answer_dict_, _ = convert_tokens(
                     eval_dict, id.tolist(), ymin.tolist(), ymax.tolist())
                 answer_dict.update(answer_dict_)
@@ -295,7 +293,7 @@ class Trainer(object):
 
     def _resume_checkpoint(self, resume_path):
         print("Loading checkpoint: {} ...".format(resume_path))
-        checkpoint = torch.load(resume_path, map_location=lambda storage, loc: storage)
+        checkpoint = torch.load(resume_path)
         self.start_epoch = checkpoint['epoch'] + 1
         self.model.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])

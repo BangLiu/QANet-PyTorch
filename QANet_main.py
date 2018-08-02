@@ -14,7 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from datetime import datetime
 from data_loader.SQuAD import prepro, get_loader
-from model.QANet_hackiey import QANet                 # !!!!!!!!!!!!!!!!
+from model.QANet_hackiey import QANet
 from trainer.QANet_trainer import Trainer
 from util.visualize import Visualizer
 from model.modules.ema import EMA
@@ -306,21 +306,20 @@ def main(args):
 
     # set optimizer and scheduler
     parameters = filter(lambda p: p.requires_grad, model.parameters())
-    base_lr = 1.0
     optimizer = optim.Adam(
         params=parameters,
-        lr=base_lr,
+        lr=args.lr,
         betas=(args.beta1, args.beta2),
-        eps=1e-7,
+        eps=1e-8,
         weight_decay=3e-7)
-    cr = args.lr / math.log2(args.lr_warm_up_num)
+    cr = 1.0 / math.log(args.lr_warm_up_num)
     scheduler = optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=lambda ee: cr * math.log2(ee + 1)
-        if ee < args.lr_warm_up_num else args.lr)
+        lr_lambda=lambda ee: cr * math.log(ee + 1)
+        if ee < args.lr_warm_up_num else 1)
 
     # set loss, metrics
-    loss = F.nll_loss
+    loss = torch.nn.CrossEntropyLoss()
 
     # set visdom visualizer to store training process information
     # see the training process on http://localhost:8097/
