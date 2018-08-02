@@ -14,8 +14,9 @@ Run `python3 QANet_main.py --batch_size 32 --epochs 3 --with_cuda --use_ema --de
 ## **Performance**
 
 With ema (24 epochs):
-F1: 79.51
-EM: 70.17
+
+F1: **79.51**
+EM: **70.17**
 
 ## Structure
 QANet_main.py: code for training QANet.
