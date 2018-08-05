@@ -20,7 +20,8 @@ EM: **71.24**
 
 Performance on devemopment set during 30 epochs:
 
-![training](training.png)
+<img src="https://github.com/BangLiu/QANet-PyTorch/blob/master/training.png" width="200" />
+
 
 ## Structure
 QANet_main.py: code for training QANet.
