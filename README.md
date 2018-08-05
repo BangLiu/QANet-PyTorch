@@ -20,7 +20,7 @@ EM: **71.24**
 
 Performance on devemopment set during 30 epochs:
 
-<img src="https://github.com/BangLiu/QANet-PyTorch/blob/master/training.png" width="200" />
+<img src="https://github.com/BangLiu/QANet-PyTorch/blob/master/training.png" width="500" />
 
 
 ## Structure
