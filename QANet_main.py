@@ -11,10 +11,10 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from datetime import datetime
 from data_loader.SQuAD import prepro, get_loader
-from model.QANet_hackiey import QANet
+from model.QANet_andy import QANet
+# from model.QANet_hackiey import QANet
 from trainer.QANet_trainer import Trainer
 from util.visualize import Visualizer
 from model.modules.ema import EMA
@@ -240,8 +240,12 @@ parser.add_argument(
     help='maximum char number in a word')
 parser.add_argument(
     '--d_model',
-    default=96, type=int,
+    default=128, type=int,
     help='model hidden size')
+parser.add_argument(
+    '--num_head',
+    default=8, type=int,
+    help='attention num head')
 
 
 def main(args):
@@ -290,6 +294,7 @@ def main(args):
         args.para_limit,
         args.ques_limit,
         args.d_model,
+        num_head=args.num_head,
         train_cemb=(not args.pretrained_char),
         pad=wv_word2ix["<PAD>"])
     model.summary()

@@ -457,7 +457,7 @@ class QANet(nn.Module):
 
         params = {
             "n_epochs": 30,
-            "batch_size":32,
+            "batch_size": 32,
             "learning_rate": 1e-3,
             "beta1": 0.8,
             "beta2": 0.999,
@@ -466,13 +466,13 @@ class QANet(nn.Module):
             "word_embed_dim": 300,
 
             "char_dim": 64,
-            "char_embed_n_filters": 128,
+            "char_embed_n_filters": d_model,
             "char_embed_kernel_size": 5,
             "char_embed_pad": 2,
 
             "highway_n_layers": 2,
 
-            "hidden_size": 128,
+            "hidden_size": d_model,
 
             "embed_encoder_resize_kernel_size": 5,
             "embed_encoder_resize_pad": 3,
@@ -483,7 +483,7 @@ class QANet(nn.Module):
             "embed_encoder_pad": 3,
             "embed_encoder_conv_type": "depthwise_separable",
             "embed_encoder_with_self_attn": False,
-            "embed_encoder_n_heads": 1,
+            "embed_encoder_n_heads": num_head,
 
             "model_encoder_n_blocks": 7,
             "model_encoder_n_conv": 2,
@@ -491,10 +491,10 @@ class QANet(nn.Module):
             "model_encoder_pad": 2,
             "model_encoder_conv_type": "depthwise_separable",
             "model_encoder_with_self_attn": False,
-            "model_encoder_n_heads": 1,
+            "model_encoder_n_heads": num_head,
 
-            "para_limit": 400,
-            "ques_limit": 50,
+            "para_limit": c_max_len,
+            "ques_limit": q_max_len,
             "ans_limit": 30,
             "char_limit": 16
         }

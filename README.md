@@ -13,10 +13,10 @@ Run `python3 QANet_main.py --batch_size 32 --epochs 3 --with_cuda --use_ema --de
 
 ## **Performance**
 
-With ema (24 epochs):
+With ema, 8 head attention, hidden size 128, QANet_andy.model,  30 epochs, batch_size 16:
 
-F1: **79.51**
-EM: **70.17**
+F1: **80.49**
+EM: **71.24**
 
 ## Structure
 QANet_main.py: code for training QANet.
