@@ -18,7 +18,7 @@ With ema, 8 head attention, hidden size 128, QANet_andy.model,  30 epochs, batch
 F1: **80.49**
 EM: **71.24**
 
-Performance on devemopment set during 30 epochs:
+Performance on validation set during 30 epochs:
 
 <img src="https://github.com/BangLiu/QANet-PyTorch/blob/master/training.png" width="500" />
 
