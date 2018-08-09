@@ -195,7 +195,6 @@ class Embedding(nn.Module):
         ch_emb = self.conv2d(ch_emb)
         ch_emb = F.relu(ch_emb)
         ch_emb, _ = torch.max(ch_emb, dim=3)
-        ch_emb = ch_emb.squeeze()
 
         wd_emb = F.dropout(wd_emb, p=self.dropout_w, training=self.training)
         wd_emb = wd_emb.transpose(1, 2)
