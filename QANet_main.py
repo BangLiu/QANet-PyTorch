@@ -14,7 +14,6 @@ import torch.optim as optim
 from datetime import datetime
 from data_loader.SQuAD import prepro, get_loader
 from model.QANet import QANet
-# from model.QANet_hackiey import QANet
 from trainer.QANet_trainer import Trainer
 from util.visualize import Visualizer
 from model.modules.ema import EMA
